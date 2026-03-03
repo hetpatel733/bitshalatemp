@@ -19,14 +19,24 @@ async function main() {
       await client.createWallet('Miner');
       console.log('✓ Miner wallet created');
     } catch (e) {
-      console.log('⚠️  Miner wallet already exists');
+      try {
+        await client.loadWallet('Miner');
+        console.log('✓ Miner wallet loaded');
+      } catch (le) {
+        console.log('⚠️  Miner wallet already loaded');
+      }
     }
 
     try {
       await client.createWallet('Trader');
       console.log('✓ Trader wallet created\n');
     } catch (e) {
-      console.log('⚠️  Trader wallet already exists\n');
+      try {
+        await client.loadWallet('Trader');
+        console.log('✓ Trader wallet loaded\n');
+      } catch (le) {
+        console.log('⚠️  Trader wallet already loaded\n');
+      }
     }
 
     // Get Miner address
