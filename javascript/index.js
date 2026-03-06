@@ -208,9 +208,13 @@ async function main() {
         { [bobReceiveAddress]: eachReceives }
     ];
 
-    // Create spending PSBT and populate witness UTXO data
+    // Create spending PSBT and populate witness UTXO data + witness script
     let spendingPsbt = await client.command('createpsbt', spendingInputs, spendingOutputs);
-    spendingPsbt = await client.command('utxoupdatepsbt', spendingPsbt);
+    // Pass the multisig descriptor to utxoupdatepsbt so it populates the witness script
+    // in the PSBT input. Without this, descriptor wallets won't recognize the multisig.
+    const multisigDesc = `wsh(multi(2,${alicePubKey},${bobPubKey}))`;
+    const multisigDescInfo = await client.command('getdescriptorinfo', multisigDesc);
+    spendingPsbt = await client.command('utxoupdatepsbt', spendingPsbt, [multisigDescInfo.descriptor]);
 
     // Both Alice and Bob must sign (2-of-2 multisig)
     const aliceSpendSigned = await alice.command('walletprocesspsbt', spendingPsbt);
