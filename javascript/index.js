@@ -25,7 +25,6 @@ async function loadOrCreateWallet(name) {
         if (msg.includes('already loaded')) {
             console.log(`Wallet '${name}' already loaded`);
         } else {
-            // Try creating as legacy wallet first (descriptors=false for simpler multisig handling)
             try {
                 await client.command('createwallet', name, false, false, '', false, false);
                 console.log(`Wallet '${name}' created (legacy)`);
@@ -35,7 +34,6 @@ async function loadOrCreateWallet(name) {
                     await client.command('loadwallet', name);
                     console.log(`Wallet '${name}' loaded (existing)`);
                 } else {
-                    // Fall back to descriptor wallet
                     try {
                         await client.command('createwallet', name);
                         console.log(`Wallet '${name}' created (descriptor)`);
@@ -69,7 +67,6 @@ async function main() {
     const bob = getWalletClient('Bob');
 
     // Generate spendable balances in the Miner wallet (≥ 150 BTC)
-    // Regtest coinbase maturity = 100 blocks, so mine at least 103 blocks for 3 * 50 BTC = 150 BTC
     const minerAddress = await miner.getNewAddress();
     const currentBlocks = (await client.getBlockchainInfo()).blocks;
 
@@ -99,7 +96,6 @@ async function main() {
     console.log(`Bob balance after funding: ${await bob.getBalance()} BTC`);
 
     // Construct 2-of-2 multisig (Alice & Bob) using P2WSH (native segwit)
-    // Get a legacy address from each wallet to extract their compressed public keys
     const aliceKeyAddr = await alice.getNewAddress('', 'legacy');
     const bobKeyAddr = await bob.getNewAddress('', 'legacy');
     const aliceAddrInfo = await alice.getAddressInfo(aliceKeyAddr);
@@ -109,31 +105,30 @@ async function main() {
     console.log(`Alice pubkey: ${alicePubKey}`);
     console.log(`Bob pubkey: ${bobPubKey}`);
 
-    // Create 2-of-2 P2WSH multisig address (bech32 = native segwit witness_v0_scripthash)
+    // Create 2-of-2 P2WSH multisig address
     const multisigResult = await client.command('createmultisig', 2, [alicePubKey, bobPubKey], 'bech32');
     const multisigAddress = multisigResult.address;
     const witnessScript = multisigResult.redeemScript;
     console.log(`Multisig P2WSH address: ${multisigAddress}`);
     console.log(`Witness script: ${witnessScript}`);
 
-    // Register the multisig in both wallets so they can sign spending transactions
+    // Import multisig descriptor into both wallets for signing
+    const desc = `wsh(multi(2,${alicePubKey},${bobPubKey}))`;
+    const descInfo = await client.command('getdescriptorinfo', desc);
+    const fullDesc = descInfo.descriptor;
+
     try {
         await alice.command('addmultisigaddress', 2, [alicePubKey, bobPubKey], '', 'bech32');
         await bob.command('addmultisigaddress', 2, [alicePubKey, bobPubKey], '', 'bech32');
         console.log('Multisig registered in Alice and Bob wallets');
     } catch (e) {
-        // Descriptor wallet fallback: use importdescriptors
         console.log(`addmultisigaddress failed (${e.message}), falling back to importdescriptors`);
-        const desc = `wsh(multi(2,${alicePubKey},${bobPubKey}))`;
-        const descInfo = await client.command('getdescriptorinfo', desc);
-        const fullDesc = descInfo.descriptor;
         await alice.command('importdescriptors', [{ desc: fullDesc, timestamp: 'now' }]);
         await bob.command('importdescriptors', [{ desc: fullDesc, timestamp: 'now' }]);
         console.log('Multisig descriptor imported into Alice and Bob wallets');
     }
 
-    // Build funding PSBT: Alice and Bob each contribute one UTXO (15 BTC each)
-    // Total input: 30 BTC → 20 BTC to multisig + equal change to Alice and Bob
+    // Build funding PSBT: Alice and Bob each contribute one UTXO
     const aliceUTXOs = await alice.command('listunspent');
     const bobUTXOs = await bob.command('listunspent');
 
@@ -144,7 +139,6 @@ async function main() {
     const totalInput = aliceUTXO.amount + bobUTXO.amount;
     const multisigAmount = 20;
     const fundingFee = 0.0002;
-    // Both change outputs must be exactly equal (validated by test)
     const changeEach = parseFloat(((totalInput - multisigAmount - fundingFee) / 2).toFixed(8));
 
     const aliceChangeAddress = await alice.getNewAddress();
@@ -160,20 +154,17 @@ async function main() {
         { [bobChangeAddress]: changeEach }
     ];
 
-    // Create raw PSBT and populate UTXO data
+    // Create, sign, and broadcast funding transaction via PSBT
     let fundingPsbt = await client.command('createpsbt', fundingInputs, fundingOutputs);
     fundingPsbt = await client.command('utxoupdatepsbt', fundingPsbt);
 
-    // Each wallet signs its own input
     const aliceFundSigned = await alice.command('walletprocesspsbt', fundingPsbt);
     const bobFundSigned = await bob.command('walletprocesspsbt', fundingPsbt);
 
-    // Combine partial signatures and finalize
     const combinedFunding = await client.command('combinepsbt', [aliceFundSigned.psbt, bobFundSigned.psbt]);
     const finalizedFunding = await client.command('finalizepsbt', combinedFunding);
     if (!finalizedFunding.complete) throw new Error('Funding PSBT could not be finalized');
 
-    // Sign & broadcast the funding PSBT
     const fundingTxId = await client.sendRawTransaction(finalizedFunding.hex);
     console.log(`Funding TX ID: ${fundingTxId}`);
 
@@ -181,11 +172,10 @@ async function main() {
     await client.command('generatetoaddress', 6, minerAddress);
     console.log('Mined 6 blocks to confirm funding transaction');
 
-    // Print balances for Alice and Bob
     console.log(`Alice balance: ${await alice.getBalance()} BTC`);
     console.log(`Bob balance: ${await bob.getBalance()} BTC`);
 
-    // Build spending PSBT: spend the multisig output, distributing ~10 BTC equally to Alice and Bob
+    // Build spending transaction: spend the multisig output
     const fundingTxDetails = await client.command('getrawtransaction', fundingTxId, true);
     let multisigVout = -1;
     for (let i = 0; i < fundingTxDetails.vout.length; i++) {
@@ -209,32 +199,38 @@ async function main() {
         { [bobReceiveAddress]: eachReceives }
     ];
 
-    // Create spending PSBT and populate witness UTXO data + witness script
-    let spendingPsbt = await client.command('createpsbt', spendingInputs, spendingOutputs);
-    // Pass the multisig descriptor to utxoupdatepsbt so it populates the witness script
-    // in the PSBT input. Without this, descriptor wallets won't recognize the multisig.
-    const multisigDesc = `wsh(multi(2,${alicePubKey},${bobPubKey}))`;
-    const multisigDescInfo = await client.command('getdescriptorinfo', multisigDesc);
-    spendingPsbt = await client.command('utxoupdatepsbt', spendingPsbt, [multisigDescInfo.descriptor]);
+    // Create raw spending transaction
+    const spendingRawTx = await client.command('createrawtransaction', spendingInputs, spendingOutputs);
 
-    // Both Alice and Bob must sign (2-of-2 multisig)
-    const aliceSpendSigned = await alice.command('walletprocesspsbt', spendingPsbt);
-    const bobSpendSigned = await bob.command('walletprocesspsbt', spendingPsbt);
+    // Provide prevtxs with the witnessScript so wallets can sign the P2WSH multisig input
+    const multisigOutput = fundingTxDetails.vout[multisigVout];
+    const prevTxs = [{
+        txid: fundingTxId,
+        vout: multisigVout,
+        scriptPubKey: multisigOutput.scriptPubKey.hex,
+        redeemScript: witnessScript,
+        witnessScript: witnessScript,
+        amount: multisigAmount
+    }];
 
-    // Combine partial signatures and finalize
-    const combinedSpending = await client.command('combinepsbt', [aliceSpendSigned.psbt, bobSpendSigned.psbt]);
-    const finalizedSpending = await client.command('finalizepsbt', combinedSpending);
-    if (!finalizedSpending.complete) throw new Error('Spending PSBT could not be finalized');
+    // Sign sequentially: Alice signs first, then Bob signs Alice's partially-signed tx
+    const aliceSigned = await alice.command('signrawtransactionwithwallet', spendingRawTx, prevTxs);
+    console.log(`Alice signed spending tx (complete: ${aliceSigned.complete})`);
 
-    // Sign & broadcast the spending PSBT
-    const spendingTxId = await client.sendRawTransaction(finalizedSpending.hex);
+    const bobSigned = await bob.command('signrawtransactionwithwallet', aliceSigned.hex, prevTxs);
+    console.log(`Bob signed spending tx (complete: ${bobSigned.complete})`);
+
+    if (!bobSigned.complete) throw new Error('Spending transaction could not be fully signed');
+
+    // Broadcast the fully signed spending transaction
+    const spendingTxId = await client.sendRawTransaction(bobSigned.hex);
     console.log(`Spending TX ID: ${spendingTxId}`);
 
     // Mine 6 blocks to confirm the spending transaction
     await client.command('generatetoaddress', 6, minerAddress);
     console.log('Mined 6 blocks to confirm spending transaction');
 
-    // Print final balances for Alice and Bob
+    // Print final balances
     console.log(`Final Alice balance: ${await alice.getBalance()} BTC`);
     console.log(`Final Bob balance: ${await bob.getBalance()} BTC`);
 
