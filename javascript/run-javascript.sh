@@ -1,2 +1,3 @@
+cd javascript
 npm install
-node ./javascript/index.js
+node index.js
